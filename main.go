@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -79,6 +80,12 @@ type copyDoneMsg struct {
 	Filename string
 	Success  bool
 	Error    error
+}
+
+type runCommandMsg struct {
+	Command string
+	Output  string
+	Error   error
 }
 
 func initialModel() model {
@@ -198,6 +205,70 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		key := msg.String()
+
+		if m.focusOnTerminal {
+			// Разрешаем глобальные хоткеи, которые должны работать в любом случае
+			switch key {
+			case "ctrl+c", "q":
+				return m, tea.Quit
+			case "ctrl+t", "ctrl+up", "ctrl+down", "alt+up", "alt+down":
+				// пусть дальше основной switch их обработает
+			case "enter":
+				// Обработка команды ENTER при фокусе на терминале:
+				input := strings.TrimSpace(m.termInput.Value())
+				if input != "" {
+					// Сначала — builtin cd
+					parts := strings.Fields(input)
+					if len(parts) > 0 && parts[0] == "cd" {
+						var newPath string
+						if len(parts) == 1 || parts[1] == "~" {
+							newPath = os.Getenv("HOME")
+						} else {
+							base := m.leftDir
+							if m.activePanel == 1 {
+								base = m.rightDir
+							}
+							newPath = parts[1]
+							if !filepath.IsAbs(newPath) {
+								newPath = filepath.Join(base, newPath)
+							}
+						}
+						if fi, err := os.Stat(newPath); err == nil && fi.IsDir() {
+							if m.activePanel == 0 {
+								m.leftDir = newPath
+								m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
+								m.leftCursor, m.leftScroll = 0, 0
+							} else {
+								m.rightDir = newPath
+								m.rightItems = getDirItems(m.rightDir, m.showHiddenRight)
+								m.rightCursor, m.rightScroll = 0, 0
+							}
+							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\n--> cd %s", input, newPath))
+						} else {
+							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\ncd: no such directory: %s", input, newPath))
+						}
+						m.termInput.SetValue("")
+						return m, nil
+					}
+
+					// Иначе — выполняем разрешённую внешнюю команду асинхронно
+					m.termOutput = append(m.termOutput, "$ "+input)
+					workingDir := m.leftDir
+					if m.activePanel == 1 {
+						workingDir = m.rightDir
+					}
+					cmds = append(cmds, runCommandAsync(input, workingDir))
+					m.termInput.SetValue("")
+				}
+				return m, tea.Batch(cmds...)
+			default:
+				// всё остальное (включая стрелки) направляем в текстовый инпут
+				m.termInput, cmd = m.termInput.Update(msg)
+				cmds = append(cmds, cmd)
+				return m, tea.Batch(cmds...)
+			}
+		}
+
 		switch key {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -364,31 +435,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedRight = make(map[string]bool)
 			}
 
-			case "r": // Переименовать
-			            // Инициализируем состояние переименования
-			            m.renaming = true
-			
-			            // Определяем какая панель активна
-			            if m.activePanel == 0 {
-			                selected := m.leftItems[m.leftCursor]
-			                m.renameOldPath = filepath.Join(m.leftDir, selected)
-			                m.renamePanel = 0
-			
-			            } else {
-			                selected := m.rightItems[m.rightCursor]
-			                m.renameOldPath = filepath.Join(m.rightDir, selected)
-			                m.renamePanel = 1
-			            }
-			
-			            // Устанавливаем параметры для поля ввода переименования
-			            m.renameInput = textinput.New()
-			            m.renameInput.Placeholder = filepath.Base(m.renameOldPath)
-			            m.renameInput.Focus()
-			            m.renameInput.CharLimit = 256
-			            m.renameInput.Width = 30
-			
-			            cmd = m.renameInput.Focus()
-			            cmds = append(cmds, cmd)
+		case "r": // Переименовать
+			// Инициализируем состояние переименования
+			m.renaming = true
+
+			// Определяем какая панель активна
+			if m.activePanel == 0 {
+				selected := m.leftItems[m.leftCursor]
+				m.renameOldPath = filepath.Join(m.leftDir, selected)
+				m.renamePanel = 0
+
+			} else {
+				selected := m.rightItems[m.rightCursor]
+				m.renameOldPath = filepath.Join(m.rightDir, selected)
+				m.renamePanel = 1
+			}
+
+			// Устанавливаем параметры для поля ввода переименования
+			m.renameInput = textinput.New()
+			m.renameInput.Placeholder = filepath.Base(m.renameOldPath)
+			m.renameInput.Focus()
+			m.renameInput.CharLimit = 256
+			m.renameInput.Width = 30
+
+			cmd = m.renameInput.Focus()
+			cmds = append(cmds, cmd)
 
 		case "x":
 			m.clipboard = []string{}
@@ -409,10 +480,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "alt+left":
 			m.activePanel = 0
-			m.focusOnTerminal = false
 		case "alt+right":
 			m.activePanel = 1
-			m.focusOnTerminal = false
 		case "alt+up", "alt+down":
 			m.focusOnTerminal = !m.focusOnTerminal
 
@@ -588,16 +657,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			if m.focusOnTerminal {
+				// второй обработчик ENTER (в старом месте) — тоже учитываем builtin cd
 				input := strings.TrimSpace(m.termInput.Value())
 				if input != "" {
-					m.termOutput = append(m.termOutput, "$ "+input)
-					m.termInput.SetValue("")
+					parts := strings.Fields(input)
+					if len(parts) > 0 && parts[0] == "cd" {
+						var newPath string
+						if len(parts) == 1 || parts[1] == "~" {
+							newPath = os.Getenv("HOME")
+						} else {
+							base := m.leftDir
+							if m.activePanel == 1 {
+								base = m.rightDir
+							}
+							newPath = parts[1]
+							if !filepath.IsAbs(newPath) {
+								newPath = filepath.Join(base, newPath)
+							}
+						}
+						if fi, err := os.Stat(newPath); err == nil && fi.IsDir() {
+							if m.activePanel == 0 {
+								m.leftDir = newPath
+								m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
+								m.leftCursor, m.leftScroll = 0, 0
+							} else {
+								m.rightDir = newPath
+								m.rightItems = getDirItems(m.rightDir, m.showHiddenRight)
+								m.rightCursor, m.rightScroll = 0, 0
+							}
+							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\n--> cd %s", input, newPath))
+						} else {
+							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\ncd: no such directory: %s", input, newPath))
+						}
+						m.termInput.SetValue("")
+					} else {
+						m.termOutput = append(m.termOutput, "$ "+input)
+						workingDir := m.leftDir
+						if m.activePanel == 1 {
+							workingDir = m.rightDir
+						}
+						cmds = append(cmds, runCommandAsync(input, workingDir))
+						m.termInput.SetValue("")
+					}
 				}
 			}
 		default:
 			if m.focusOnTerminal {
 				m.termInput, cmd = m.termInput.Update(msg)
 				cmds = append(cmds, cmd)
+				return m, tea.Batch(cmds...)
 			}
 		}
 
@@ -621,6 +729,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.termOutput = append(m.termOutput, fmt.Sprintf("Failed to copy %s: %v", msg.Filename, msg.Error))
 			m.flashMessage = fmt.Sprintf("Error copying %s", msg.Filename)
 			m.flashTimer = time.Now()
+		}
+
+	case runCommandMsg:
+		// Добавляем вывод команды в терминал
+		if msg.Error != nil {
+			m.termOutput = append(m.termOutput, fmt.Sprintf("Error: %v", msg.Error))
+		}
+		if msg.Output != "" {
+			// Разбиваем вывод на строки и добавляем каждую строку
+			lines := strings.Split(strings.TrimRight(msg.Output, "\n"), "\n")
+			m.termOutput = append(m.termOutput, lines...)
 		}
 
 	case tea.WindowSizeMsg:
@@ -751,6 +870,89 @@ func copyFileAsync(ctx context.Context, src, dst string) tea.Cmd {
 		}
 
 		return copyDoneMsg{Filename: dst, Success: true}
+	}
+}
+
+// runCommandAsync выполняет команду оболочки в фоне и возвращает результат.
+func runCommandAsync(command string, workingDir string) tea.Cmd {
+	return func() tea.Msg {
+		cmdStr := strings.TrimSpace(command)
+		if cmdStr == "" {
+			return runCommandMsg{
+				Command: command,
+				Output:  "",
+				Error:   fmt.Errorf("empty command"),
+			}
+		}
+
+		parts := strings.Fields(cmdStr)
+		if len(parts) == 0 {
+			return runCommandMsg{
+				Command: command,
+				Output:  "",
+				Error:   fmt.Errorf("empty command"),
+			}
+		}
+
+		cmdName := parts[0]
+		args := parts[1:]
+
+		// НЕ запускаем shell (sh -c) — запускаем конкретную команду.
+		// whitelist — добавляйте сюда только безопасные команды, которые хотите разрешить.
+		allowed := map[string]bool{
+			"ls":   true,
+			"pwd":  true,
+			"cat":  true,
+			"echo": true,
+			"head": true,
+			"tail": true,
+			"stat": true,
+			"date": true,
+		}
+
+		// Если команда — cd, сообщаем об этом как ошибке: cd обрабатывается в приложении как builtin.
+		if cmdName == "cd" {
+			return runCommandMsg{
+				Command: command,
+				Output:  "",
+				Error:   fmt.Errorf("cd is a builtin and handled by the application"),
+			}
+		}
+
+		if !allowed[cmdName] {
+			return runCommandMsg{
+				Command: command,
+				Output:  fmt.Sprintf("command not allowed: %s", cmdName),
+				Error:   nil,
+			}
+		}
+
+		// Таймаут для команды — чтобы не зависала надолго
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, cmdName, args...)
+		cmd.Dir = workingDir
+
+		output, err := cmd.CombinedOutput()
+		outStr := string(output)
+
+		// Если был таймаут, заменим ошибку понятной строкой
+		if ctx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("command timed out")
+		}
+
+		// Ограничим вывод, чтобы не засорять память/интерфейс
+		const maxOut = 20000
+		if len(outStr) > maxOut {
+			outStr = outStr[:maxOut] + "\n...[output truncated]"
+		}
+
+		return runCommandMsg{
+			Command: command,
+			Output:  outStr,
+			Error:   err,
+		}
 	}
 }
 
@@ -916,14 +1118,14 @@ func renderPanel(dir string, items []string, selected map[string]bool, active bo
 						Foreground(lipgloss.Color("0")).
 						Background(lipgloss.Color("213")).
 						Bold(true).
-						Render("[*] "+item),
+						Render("[*] " + item),
 				)
 			} else {
 				body.WriteString(
 					lipgloss.NewStyle().
 						Foreground(lipgloss.Color("171")).
 						Bold(true).
-						Render("● "+item),
+						Render("● " + item),
 				)
 			}
 		} else {
@@ -931,7 +1133,7 @@ func renderPanel(dir string, items []string, selected map[string]bool, active bo
 				body.WriteString(
 					lipgloss.NewStyle().
 						Foreground(lipgloss.Color("213")).
-						Render("[*] "+item),
+						Render("[*] " + item),
 				)
 			} else {
 				body.WriteString("   " + item)
