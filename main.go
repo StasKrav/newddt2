@@ -206,18 +206,76 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		key := msg.String()
 
+		// Если фокус в терминале — в первую очередь обрабатываем это отдельно
 		if m.focusOnTerminal {
-			// Разрешаем глобальные хоткеи, которые должны работать в любом случае
+			// Обрабатываем сочетания, которые должны работать даже когда терминал в фокусе
 			switch key {
 			case "ctrl+c", "q":
 				return m, tea.Quit
-			case "ctrl+t", "ctrl+up", "ctrl+down", "alt+up", "alt+down":
-				// пусть дальше основной switch их обработает
-			case "enter":
-				// Обработка команды ENTER при фокусе на терминале:
+
+			case "esc":
+				m.focusOnTerminal = false
+				m.termInput.Blur()
+				return m, tea.Batch(cmds...)
+
+			case "alt+up", "alt+down":
+				m.focusOnTerminal = !m.focusOnTerminal
+				if m.focusOnTerminal {
+					m.termInput.Focus()
+				} else {
+					m.termInput.Blur()
+				}
+				return m, tea.Batch(cmds...)
+
+			case "alt+left":
+				m.activePanel = 0
+				return m, tea.Batch(cmds...)
+			case "alt+right":
+				m.activePanel = 1
+				return m, tea.Batch(cmds...)
+
+			case "ctrl+up":
+				m.targetTermHeight++
+				if m.targetTermHeight > m.height-3 {
+					m.targetTermHeight = m.height - 3
+				}
+				m.termAnimating = true
+				cmds = append(cmds, animateTerminalCmd())
+				return m, tea.Batch(cmds...)
+
+			case "ctrl+down":
+				if m.targetTermHeight > 0 {
+					m.targetTermHeight--
+				}
+				m.termAnimating = true
+				cmds = append(cmds, animateTerminalCmd())
+				return m, tea.Batch(cmds...)
+
+			case "ctrl+t":
+				m.terminalMode = (m.terminalMode + 1) % 4
+				switch m.terminalMode {
+				case TermBottomHidden:
+					m.targetTermHeight = 0
+				case TermCompact:
+					m.targetTermHeight = 6
+				case TermExpanded:
+					m.targetTermHeight = m.height / 2
+				case TermHiddenTop:
+					m.targetTermHeight = 1
+				}
+				m.termAnimating = true
+				cmds = append(cmds, animateTerminalCmd())
+				return m, tea.Batch(cmds...)
+			}
+
+			// Не глобальная комбинация — проксируем в textinput
+			m.termInput, cmd = m.termInput.Update(msg)
+			cmds = append(cmds, cmd)
+
+			// Обработка Enter в терминале (после обновления textinput, чтобы курсор/редактирование работали)
+			if key == "enter" {
 				input := strings.TrimSpace(m.termInput.Value())
 				if input != "" {
-					// Сначала — builtin cd
 					parts := strings.Fields(input)
 					if len(parts) > 0 && parts[0] == "cd" {
 						var newPath string
@@ -248,10 +306,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\ncd: no such directory: %s", input, newPath))
 						}
 						m.termInput.SetValue("")
-						return m, nil
+						return m, tea.Batch(cmds...)
 					}
 
-					// Иначе — выполняем разрешённую внешнюю команду асинхронно
+					// Внешняя команда
 					m.termOutput = append(m.termOutput, "$ "+input)
 					workingDir := m.leftDir
 					if m.activePanel == 1 {
@@ -259,21 +317,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					cmds = append(cmds, runCommandAsync(input, workingDir))
 					m.termInput.SetValue("")
+					return m, tea.Batch(cmds...)
 				}
-				return m, tea.Batch(cmds...)
-			default:
-				// всё остальное (включая стрелки) направляем в текстовый инпут
-				m.termInput, cmd = m.termInput.Update(msg)
-				cmds = append(cmds, cmd)
+				// пустой ввод
 				return m, tea.Batch(cmds...)
 			}
+
+			// Все прочие клавиши — уже обработаны/проксированы выше
+			return m, tea.Batch(cmds...)
+
 		}
 
+		// Ниже — обработка клавиш когда фокуса на терминале нет
 		switch key {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
-		// ПРОБЕЛ — выделение/снятие выделения
 		case " ":
 			if m.activePanel == 0 {
 				if len(m.leftItems) > 0 {
@@ -295,7 +354,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "p": // Вставить
+		case "p":
 			if len(m.clipboard) > 0 {
 				var destDir string
 				if m.activePanel == 0 {
@@ -310,8 +369,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					switch m.operation {
 					case "copy":
 						ctx := context.Background()
-						cmd := copyFileAsync(ctx, sourceFile, destPath)
-						cmds = append(cmds, cmd)
+						c := copyFileAsync(ctx, sourceFile, destPath)
+						cmds = append(cmds, c)
 						m.termOutput = append(m.termOutput, fmt.Sprintf("Started copying %s → %s", filepath.Base(sourceFile), destDir))
 					case "move":
 						err := os.Rename(sourceFile, destPath)
@@ -319,28 +378,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.termOutput = append(m.termOutput, "Error moving: "+err.Error())
 						} else {
 							m.termOutput = append(m.termOutput, "Moved to: "+destPath)
-							// обновляем панели
 							m.refreshPanelsAfterChange(filepath.Dir(sourceFile))
 							m.refreshPanelsAfterChange(destDir)
 						}
 					}
 				}
 
-				// Обновляем списки
 				m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
 				m.rightItems = getDirItems(m.rightDir, m.showHiddenRight)
-
-				// Очищаем состояния
 				m.clipboard = []string{}
 				m.operation = ""
 				m.selectedLeft = make(map[string]bool)
 				m.selectedRight = make(map[string]bool)
-
-				// Обновляем панели для отображения
 				m.refreshPanelsAfterChange(destDir)
 			}
 
-		case "c": // Копировать (в буфер)
+		case "c":
 			m.clipboard = []string{}
 			if m.activePanel == 0 {
 				if len(m.selectedLeft) > 0 {
@@ -363,11 +416,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.operation = "copy"
 			m.termOutput = append(m.termOutput, "Copied to clipboard.")
-			// Очистим выделения после копирования в буфер
 			m.selectedLeft = make(map[string]bool)
 			m.selectedRight = make(map[string]bool)
 
-		case "m": // Переместить (в буфер)
+		case "m":
 			m.clipboard = []string{}
 			if m.activePanel == 0 {
 				if len(m.selectedLeft) > 0 {
@@ -390,11 +442,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.operation = "move"
 			m.termOutput = append(m.termOutput, "Ready to move.")
-			// Очистим выделения
 			m.selectedLeft = make(map[string]bool)
 			m.selectedRight = make(map[string]bool)
 
-		case "D": // Удалить (поддерживает множественное выделение)
+		case "D":
 			var targets []string
 			if m.activePanel == 0 {
 				if len(m.selectedLeft) > 0 {
@@ -425,39 +476,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.termOutput = append(m.termOutput, "Deleted: "+filepath.Base(t))
 					}
 				}
-				// Обновляем панели после удаления
 				m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
 				m.rightItems = getDirItems(m.rightDir, m.showHiddenRight)
 				m.leftCursor, m.leftScroll = 0, 0
 				m.rightCursor, m.rightScroll = 0, 0
-				// Очистим выделения
 				m.selectedLeft = make(map[string]bool)
 				m.selectedRight = make(map[string]bool)
 			}
 
-		case "r": // Переименовать
-			// Инициализируем состояние переименования
+		case "r":
 			m.renaming = true
-
-			// Определяем какая панель активна
 			if m.activePanel == 0 {
 				selected := m.leftItems[m.leftCursor]
 				m.renameOldPath = filepath.Join(m.leftDir, selected)
 				m.renamePanel = 0
-
 			} else {
 				selected := m.rightItems[m.rightCursor]
 				m.renameOldPath = filepath.Join(m.rightDir, selected)
 				m.renamePanel = 1
 			}
-
-			// Устанавливаем параметры для поля ввода переименования
 			m.renameInput = textinput.New()
 			m.renameInput.Placeholder = filepath.Base(m.renameOldPath)
 			m.renameInput.Focus()
 			m.renameInput.CharLimit = 256
 			m.renameInput.Width = 30
-
 			cmd = m.renameInput.Focus()
 			cmds = append(cmds, cmd)
 
@@ -465,7 +507,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clipboard = []string{}
 			m.operation = ""
 			m.termOutput = append(m.termOutput, "Clipboard cleared.")
-			// очистить выделения тоже на всякий
 			m.selectedLeft = make(map[string]bool)
 			m.selectedRight = make(map[string]bool)
 
@@ -483,7 +524,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "alt+right":
 			m.activePanel = 1
 		case "alt+up", "alt+down":
+			// переключаем фокус терминала и обновляем состояние textinput.Focus()/Blur()
 			m.focusOnTerminal = !m.focusOnTerminal
+			if m.focusOnTerminal {
+				m.termInput.Focus()
+			} else {
+				m.termInput.Blur()
+			}
 
 		case "left":
 			if m.activePanel == 0 {
@@ -503,7 +550,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "right":
-			// Вход в директорию или использование буфера (поддержка множественных элементов)
 			if m.activePanel == 0 {
 				if len(m.leftItems) == 0 {
 					break
@@ -516,7 +562,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
 					m.leftCursor, m.leftScroll = 0, 0
 				} else {
-					// Если файл и в буфере есть элементы — вставляем все
 					if len(m.clipboard) > 0 {
 						destDir := m.leftDir
 						for _, sourceFile := range m.clipboard {
@@ -654,60 +699,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.termAnimating = true
 			cmds = append(cmds, animateTerminalCmd())
-
-		case "enter":
-			if m.focusOnTerminal {
-				// второй обработчик ENTER (в старом месте) — тоже учитываем builtin cd
-				input := strings.TrimSpace(m.termInput.Value())
-				if input != "" {
-					parts := strings.Fields(input)
-					if len(parts) > 0 && parts[0] == "cd" {
-						var newPath string
-						if len(parts) == 1 || parts[1] == "~" {
-							newPath = os.Getenv("HOME")
-						} else {
-							base := m.leftDir
-							if m.activePanel == 1 {
-								base = m.rightDir
-							}
-							newPath = parts[1]
-							if !filepath.IsAbs(newPath) {
-								newPath = filepath.Join(base, newPath)
-							}
-						}
-						if fi, err := os.Stat(newPath); err == nil && fi.IsDir() {
-							if m.activePanel == 0 {
-								m.leftDir = newPath
-								m.leftItems = getDirItems(m.leftDir, m.showHiddenLeft)
-								m.leftCursor, m.leftScroll = 0, 0
-							} else {
-								m.rightDir = newPath
-								m.rightItems = getDirItems(m.rightDir, m.showHiddenRight)
-								m.rightCursor, m.rightScroll = 0, 0
-							}
-							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\n--> cd %s", input, newPath))
-						} else {
-							m.termOutput = append(m.termOutput, fmt.Sprintf("$ %s\ncd: no such directory: %s", input, newPath))
-						}
-						m.termInput.SetValue("")
-					} else {
-						m.termOutput = append(m.termOutput, "$ "+input)
-						workingDir := m.leftDir
-						if m.activePanel == 1 {
-							workingDir = m.rightDir
-						}
-						cmds = append(cmds, runCommandAsync(input, workingDir))
-						m.termInput.SetValue("")
-					}
-				}
-			}
-		default:
-			if m.focusOnTerminal {
-				m.termInput, cmd = m.termInput.Update(msg)
-				cmds = append(cmds, cmd)
-				return m, tea.Batch(cmds...)
-			}
 		}
+	// конец case tea.KeyMsg
 
 	case copyProgressMsg:
 		m.copying = true
@@ -732,12 +725,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case runCommandMsg:
-		// Добавляем вывод команды в терминал
 		if msg.Error != nil {
 			m.termOutput = append(m.termOutput, fmt.Sprintf("Error: %v", msg.Error))
 		}
 		if msg.Output != "" {
-			// Разбиваем вывод на строки и добавляем каждую строку
 			lines := strings.Split(strings.TrimRight(msg.Output, "\n"), "\n")
 			m.termOutput = append(m.termOutput, lines...)
 		}
@@ -772,6 +763,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+
 }
 
 // copyFile копирует файл или директорию (включая вложенные)
