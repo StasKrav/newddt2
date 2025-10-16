@@ -268,6 +268,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 
+			m.termInput.Width = m.width - 4
 			// Не глобальная комбинация — проксируем в textinput
 			m.termInput, cmd = m.termInput.Update(msg)
 			cmds = append(cmds, cmd)
@@ -737,6 +738,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		if m.targetTermHeight > m.height {
 			m.targetTermHeight = m.height
+			m.termInput.Width = msg.Width - 4
 		}
 		if m.terminalMode == TermExpanded {
 			m.targetTermHeight = m.height / 2
@@ -900,6 +902,7 @@ func runCommandAsync(command string, workingDir string) tea.Cmd {
 			"tail": true,
 			"stat": true,
 			"date": true,
+			"mpv":  true,
 		}
 
 		// Если команда — cd, сообщаем об этом как ошибке: cd обрабатывается в приложении как builtin.
@@ -1142,6 +1145,7 @@ func renderTerminal(m model, h, w int) string {
 	if h < 1 {
 		h = 1
 	}
+
 	borderColor := lipgloss.Color("240")
 	if m.focusOnTerminal {
 		borderColor = lipgloss.Color("171")
@@ -1150,7 +1154,8 @@ func renderTerminal(m model, h, w int) string {
 	box := lipgloss.NewStyle().
 		Width(w-2).
 		Height(h).
-		Padding(0, 1).
+		Padding(0, 1).  // top/bottom = 0, left/right = 1
+		PaddingLeft(4). // сдвигаем содержимое вправо на 2 колонки
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor)
 
@@ -1165,11 +1170,11 @@ func renderTerminal(m model, h, w int) string {
 	}
 	out := strings.Join(outLines, "\n")
 
-	m.termInput.Width = w - 4
 	inputView := m.termInput.View()
 	if m.focusOnTerminal {
 		inputView = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Render(inputView)
 	}
 
 	return box.Render(out + "\n" + inputView)
+
 }
